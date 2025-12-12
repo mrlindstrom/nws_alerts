@@ -350,7 +350,7 @@ def build_embed(props: dict, cleared: bool = False) -> dict:
     area_field = ", ".join(areas[:3]) + (f" … (+{len(areas)-3} more)" if len(areas) > 3 else "")
 
     # Description
-    # CHANGED (per your request): keep FULL text, no paragraph split, no truncation
+    # CHANGED: keep FULL text, no paragraph split, no truncation
     descr = (props.get("description", "") or "").strip()
 
     return {
