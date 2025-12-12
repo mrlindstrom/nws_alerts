@@ -352,6 +352,7 @@ def build_embed(props: dict, cleared: bool = False) -> dict:
     # Description
     # CHANGED: keep FULL text, no paragraph split, no truncation
     descr = (props.get("description", "") or "").strip()
+    descr = descr[:4000]
 
     return {
         "title": title_txt,
