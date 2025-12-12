@@ -22,6 +22,7 @@ Designed to run every minute on **Linux** via **cron** (or a systemd timer) insi
 - Automatic recovery if a Discord edit returns **404** (re‑post & update state).
 - Safe, atomic JSON writes.
 - Daily rotated logs with retention.
+- Optional: mapbox integration that will draw the alert polygons (if present)
 
 ---
 
