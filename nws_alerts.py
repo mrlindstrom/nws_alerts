@@ -367,7 +367,7 @@ def build_embed(props: dict, cleared: bool = False) -> dict:
         ],
         "footer": {
             "text": f"{props.get('senderName','NWS')} – "
-                    f"{datetime.fromisoformat(props['sent']).strftime('%b %d %I:%M %p')}"
+                    f"{datetime.fromisoformat(props['sent']).strftime('%b %d %I:%M %p')}"
         }
     }
 
