@@ -4,7 +4,7 @@ Fetch recent NWS alerts for multiple UGC zones and keep exactly ONE
 Discord webhook message per logical alert chain (Alert→Updates→Cancel).
 
 State is stored in one JSON file per zone (no SQLite needed).
-Runs once, does its work, then exits — perfect for a 1-minute cron job.
+Runs once, does its work, then exits — perfect for a 1‑minute cron job.
 """
 
 import os
