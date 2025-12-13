@@ -1,5 +1,6 @@
 {
   "user_agent": "icad_nws_alerts (root@icarey.net)",
+  "mapbox_token": "sk.ABCDEF1234567890",
   "zones": [
     {
       "zone_id": "SCC063",

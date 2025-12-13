@@ -18,7 +18,7 @@ from typing import Dict, Any, List
 
 import requests
 from dateutil.parser import isoparse
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 
 # ─────────────────────────  your table of codes  ─────────────────────────
 from lib.utility_module import event_codes     # unchanged
@@ -131,6 +131,9 @@ def load_config(config_path: Path, state_dir: Path) -> Dict[str, Any]:
     cfg.setdefault("user_agent", f"{APP_NAME}/{__version__} (noaa-alerts@icaddispatch.com)")
     cfg.setdefault("state_dir", str(state_dir))
     cfg.setdefault("log_level", "INFO")
+
+    # NEW: Mapbox token (optional). If unset, maps are skipped silently.
+    cfg.setdefault("mapbox_token", None)
 
     # ensure state dir exists
     Path(cfg["state_dir"]).mkdir(parents=True, exist_ok=True)
@@ -282,6 +285,43 @@ def event_icon(props: dict) -> str:
 
     return event_codes.get(props.get("event", ""), {}).get("icon", "ℹ️")
 
+# ───────────────────────  Mapbox static map helper (NEW)  ───────────────────────
+
+def build_mapbox_static_url(cfg: Dict[str, Any], feat: dict) -> str | None:
+    """
+    Build a Mapbox Static Images URL that overlays the alert polygon (GeoJSON).
+    If no token is configured or no geometry is present, returns None.
+    """
+    token = cfg.get("mapbox_token")
+    if not token:
+        return None
+
+    geometry = feat.get("geometry")
+    if not geometry:
+        return None
+
+    geojson = {
+        "type": "Feature",
+        "geometry": geometry,
+        "properties": {
+            "stroke": "#ff0000",
+            "stroke-width": 2,
+            "fill": "#ff0000",
+            "fill-opacity": 0.25,
+        },
+    }
+
+    geojson_str = json.dumps(geojson, separators=(",", ":"))
+    geojson_enc = quote(geojson_str, safe="")
+
+    # auto center, auto zoom
+    return (
+        "https://api.mapbox.com/styles/v1/mapbox/light-v11/static/"
+        f"geojson({geojson_enc})/"
+        "auto/800x500"
+        f"?access_token={token}"
+    )
+
 def build_embed(props: dict, cleared: bool = False) -> dict:
     ev_icon = event_icon(props)
 
@@ -310,9 +350,8 @@ def build_embed(props: dict, cleared: bool = False) -> dict:
     area_field = ", ".join(areas[:3]) + (f" … (+{len(areas)-3} more)" if len(areas) > 3 else "")
 
     # Description
+    # CHANGED: keep FULL text, no paragraph split, no truncation
     descr = (props.get("description", "") or "").strip()
-    if "\n\n" in descr:
-        descr = descr.split("\n\n", 1)[0]
     descr = descr[:4000]
 
     return {
@@ -402,6 +441,12 @@ def run_for_zone(cfg: Dict[str, Any], zone: Dict[str, Any]) -> None:
 
         try:
             embed = build_embed(props, cleared)
+
+            # NEW: attach map image (if configured + geometry exists)
+            map_url = build_mapbox_static_url(cfg, feat)
+            if map_url:
+                embed["image"] = {"url": map_url}
+
             if row is None:
                 # Never seen this chain before
                 if cleared:
