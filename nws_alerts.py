@@ -4,21 +4,23 @@ Fetch recent NWS alerts for multiple UGC zones and keep exactly ONE
 Discord webhook message per logical alert chain (Alert→Updates→Cancel).
 
 State is stored in one JSON file per zone (no SQLite needed).
-Runs once, does its work, then exits — perfect for a 1‑minute cron job.
+Runs once, does its work, then exits — perfect for a 1-minute cron job.
 """
 
 import os
 import re
 import json
 import logging
+import argparse
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
+from urllib.parse import urlencode
+from io import BytesIO
 
 import requests
 from dateutil.parser import isoparse
-from urllib.parse import urlencode, quote
 
 # ─────────────────────────  your table of codes  ─────────────────────────
 from lib.utility_module import event_codes     # unchanged
@@ -41,65 +43,62 @@ SEVERITY_COLOR = {
     "Unknown":  0x808080,
 }
 
+# ─────────────────────────  MAP ADDITIONS BEGIN  ─────────────────────────
+MAP_ATTACHMENT_FILENAME = "alert_map.png"
+
+MAPBOX_STYLE_DEFAULT = "mapbox/light-v11"
+MAP_WIDTH  = 900
+MAP_HEIGHT = 550
+
+MAP_FILL_RGBA   = (255, 0, 0, 70)    # semi-transparent fill
+MAP_STROKE_RGBA = (255, 0, 0, 230)   # outline
+MAP_STROKE_W    = 3
+
+MAP_PAD_FRAC    = 0.07
+MAP_PAD_MIN_DEG = 0.05
+MAP_DRAW_MARGIN = 10
+# ─────────────────────────  MAP ADDITIONS END  ─────────────────────────
+
+
+# ─────────────────────────  LOGGING  ─────────────────────────
+
 def get_log_level(name: str | None) -> int:
-    """Map string/int env or config values to logging levels."""
-    if name is None:
+    if not name:
         return logging.INFO
     if isinstance(name, int):
         return name
-    name = name.upper()
-    return {
-        "CRITICAL": logging.CRITICAL,
-        "ERROR":    logging.ERROR,
-        "WARNING":  logging.WARNING,
-        "INFO":     logging.INFO,
-        "DEBUG":    logging.DEBUG,
-    }.get(name, logging.INFO)
+    return getattr(logging, name.upper(), logging.INFO)
 
 
-def resolve_paths() -> tuple[Path, Path, Path]:
-    """
-    Returns (cfg_path, log_dir, state_dir), all rooted at the script's directory
-    unless overridden via env vars.
-
-    Layout (default):
-      <repo-root>/etc/config.json
-      <repo-root>/var/log/
-      <repo-root>/var/state/
-    """
+def resolve_paths(cli_config: Optional[str] = None) -> tuple[Path, Path, Path]:
     base = Path(__file__).resolve().parent
 
-    cfg_path  = Path(os.environ.get("NOAA_ALERTS_CONFIG",  base / "etc" / "config.json"))
+    cfg_path = Path(cli_config).resolve() if cli_config else Path(
+        os.environ.get("NOAA_ALERTS_CONFIG", base / "etc" / "config.json")
+    )
 
-    # Single var/ root, then split into log/ and state/
-    var_dir   = Path(os.environ.get("NOAA_ALERTS_VARDIR",  base / "var"))
-    log_dir   = Path(os.environ.get("NOAA_ALERTS_LOGDIR",  var_dir / "log"))
+    var_dir   = Path(os.environ.get("NOAA_ALERTS_VARDIR", base / "var"))
+    log_dir   = Path(os.environ.get("NOAA_ALERTS_LOGDIR", var_dir / "log"))
     state_dir = Path(os.environ.get("NOAA_ALERTS_STATEDIR", var_dir / "state"))
 
     return cfg_path, log_dir, state_dir
 
-# ─────────────────────────  LOGGING  ─────────────────────────
-def setup_logging(
-        log_dir: Path,
-        filename: str = f"{APP_NAME}.log",
-        level: int = logging.INFO,
-        backup_days: int = 14,
-) -> logging.Logger:
+
+def setup_logging(log_dir: Path, level: int) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / filename
 
     fmt = logging.Formatter(
         "%(asctime)s  %(levelname)s  %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
     )
 
     root = logging.getLogger()
     root.setLevel(level)
 
     fh = TimedRotatingFileHandler(
-        log_path,
+        log_dir / f"{APP_NAME}.log",
         when="midnight",
-        backupCount=backup_days,
+        backupCount=14,
         utc=True,
     )
     fh.setFormatter(fmt)
@@ -115,421 +114,314 @@ def setup_logging(
 
 # ─────────────────────────  CONFIG  ─────────────────────────
 
-def load_config(config_path: Path, state_dir: Path) -> Dict[str, Any]:
-    if not config_path.exists():
-        raise SystemExit(f"Config file not found: {config_path}")
-
-    with config_path.open("r", encoding="utf-8") as f:
+def load_config(path: Path, state_dir: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
         cfg = json.load(f)
 
-    # required
-    zones = cfg.get("zones")
-    if not zones or not isinstance(zones, list):
+    if not cfg.get("zones"):
         raise SystemExit("config.json must include a non-empty 'zones' list")
 
-    # defaults
-    cfg.setdefault("user_agent", f"{APP_NAME}/{__version__} (noaa-alerts@icaddispatch.com)")
+    cfg.setdefault("user_agent", f"{APP_NAME}/{__version__}")
     cfg.setdefault("state_dir", str(state_dir))
     cfg.setdefault("log_level", "INFO")
 
-    # NEW: Mapbox token (optional). If unset, maps are skipped silently.
-    cfg.setdefault("mapbox_token", None)
+    cfg.setdefault("mapbox_token", os.environ.get("MAPBOX_TOKEN"))
+    cfg.setdefault("mapbox_style", MAPBOX_STYLE_DEFAULT)
 
-    # ensure state dir exists
     Path(cfg["state_dir"]).mkdir(parents=True, exist_ok=True)
-
     return cfg
 
-# ─────────────────────────  STATE (JSON)  ─────────────────────────
+
+# ─────────────────────────  STATE  ─────────────────────────
 
 def state_path(cfg: Dict[str, Any], zone_id: str) -> str:
     return os.path.join(cfg["state_dir"], f"{zone_id}.json")
 
+
 def load_state(cfg: Dict[str, Any], zone_id: str) -> Dict[str, Any]:
-    """
-    Returns:
-      {
-        "alerts": {
-            "<canonical_id>": {
-               "cap_id": "...",
-               "discord_id": "...",
-               "status": "posted|updated|cleared",
-               "expires_at": "ISO-8601"
-            },
-            ...
-        }
-      }
-    """
-    path = state_path(cfg, zone_id)
-    if not os.path.exists(path):
-        return {"alerts": {}}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(state_path(cfg, zone_id), "r") as f:
             return json.load(f)
-    except Exception as e:
-        log.error("Failed to read state file %s: %s (starting empty)", path, e)
+    except Exception:
         return {"alerts": {}}
 
-def save_state(cfg: Dict[str, Any], zone_id: str, state: Dict[str, Any]) -> None:
-    """
-    Atomic write to avoid corruption.
-    """
-    path = state_path(cfg, zone_id)
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
-    os.replace(tmp_path, path)
 
-def prune_state(state: Dict[str, Any], now: datetime) -> None:
-    """
-    Remove any chain whose expires_at is >7 days in the past.
-    """
+def save_state(cfg: Dict[str, Any], zone_id: str, state: Dict[str, Any]):
+    tmp = state_path(cfg, zone_id) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, state_path(cfg, zone_id))
+
+
+def prune_state(state: Dict[str, Any], now: datetime):
     cutoff = (now - timedelta(days=7)).isoformat()
-    alerts = state.get("alerts", {})
-    doomed = [cid for cid, r in alerts.items() if r.get("expires_at", "") < cutoff]
-    for cid in doomed:
-        del alerts[cid]
+    for k in list(state["alerts"]):
+        if state["alerts"][k]["expires_at"] < cutoff:
+            del state["alerts"][k]
+
 
 # ───────────────────────  NOAA API helpers  ───────────────────────
 
-def hazard_color(props: dict) -> int:
-    return SEVERITY_COLOR.get(props.get("severity", "Unknown"), 0x808080)
-
 def fetch_recent_alerts(zone_id: str, ua: str) -> List[dict]:
-    """
-    Pull EVERYTHING the NWS still lists as *status=actual* for the zone.
-    No time window – that way we never miss an older alert if the job was down.
-    """
-    headers = {
-        "User-Agent": ua,
-        "Accept": "application/geo+json",
-    }
-    params = {
-        "zone": zone_id,
-        "status": "actual",
-        "limit": 500,
-    }
+    headers = {"User-Agent": ua, "Accept": "application/geo+json"}
+    params = {"zone": zone_id, "status": "actual", "limit": 500}
     url = f"https://api.weather.gov/alerts?{urlencode(params)}"
     log.debug("GET %s", url)
     r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
     return r.json()["features"]
 
-def vtec_key(props: dict) -> str | None:
-    """
-    Return 'OFFICE-PHENSIG-ETN' (e.g. 'KBGM-HT.Y-0006') if a VTEC line exists,
-    otherwise None.
-    """
-    for line in props.get("parameters", {}).get("VTEC", []):
-        m = VTEC_RE.match(line)
-        if m:
-            office, phensig, sub, etn = m.group(2), m.group(3), m.group(4), m.group(5)
-            return f"{office}-{phensig}.{sub}-{etn}"
-    return None
 
 def canonical_id(alert_id: str) -> str:
-    # urn:oid:... .003.1  -> strip last two numeric parts
-    parts = alert_id.split(".")
-    return ".".join(parts[:-2])
+    return ".".join(alert_id.split(".")[:-2])
+
 
 def chain_key(props: dict) -> str:
-    return vtec_key(props) or canonical_id(props["id"])
+    for v in props.get("parameters", {}).get("VTEC", []):
+        m = VTEC_RE.match(v)
+        if m:
+            return f"{m.group(2)}-{m.group(3)}.{m.group(4)}-{m.group(5)}"
+    return canonical_id(props["id"])
+
 
 def latest_by_chain(features: List[dict]) -> Dict[str, dict]:
-    latest = {}
+    out = {}
     for f in sorted(features, key=lambda f: f["properties"]["sent"], reverse=True):
         k = chain_key(f["properties"])
-        if k not in latest:
-            latest[k] = f
-    return latest
+        if k not in out:
+            out[k] = f
+    return out
+
 
 # ───────────────────────  Discord helpers  ───────────────────────
 
-def discord_post_embed(embed: dict, webhook_url: str) -> str:
-    payload = {
-        "embeds": [embed],
-        "allowed_mentions": {"parse": []},
-    }
-    url = webhook_url + ("&wait=true" if "?" in webhook_url else "?wait=true")
-    r = requests.post(url, json=payload, timeout=15)
+def discord_post_embed(embed: dict, webhook: str, file: Optional[Tuple[str, bytes]] = None) -> str:
+    url = webhook + ("&wait=true" if "?" in webhook else "?wait=true")
+
+    payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+
+    if not file:
+        r = requests.post(url, json=payload, timeout=30)
+        r.raise_for_status()
+        return r.json()["id"]
+
+    fname, data = file
+    payload["attachments"] = [{"id": 0, "filename": fname}]
+    files = {"files[0]": (fname, data, "image/png")}
+    r = requests.post(
+        url,
+        data={"payload_json": json.dumps(payload)},
+        files=files,
+        timeout=60,
+    )
     r.raise_for_status()
     return r.json()["id"]
 
-def discord_edit_embed(msg_id: str, embed: dict, webhook_url: str):
-    url_base = webhook_url.split("?", 1)[0]
-    url = f"{url_base}/messages/{msg_id}"
-    payload = {
-        "embeds": [embed],
-        "allowed_mentions": {"parse": []},
-    }
-    r = requests.patch(url, json=payload, timeout=15)
+
+def discord_edit_embed(msg_id: str, embed: dict, webhook: str):
+    url = f"{webhook.split('?',1)[0]}/messages/{msg_id}"
+    r = requests.patch(url, json={"embeds": [embed]}, timeout=30)
     r.raise_for_status()
 
-def event_icon(props: dict) -> str:
-    """
-    Return the emoji/icon for this alert, falling back to ℹ️ when unknown.
-    Priority:
-        1) Any code in `eventCode["NationalWeatherService"]`
-        2) Any code in `eventCode["SAME"]`
-        3) The full event text (rare fallback)
-    """
-    e_codes = props.get("eventCode", {})
 
-    for c in e_codes.get("NationalWeatherService", []):
+# ───────────────────────  EMBED  ───────────────────────
+
+def event_icon(props: dict) -> str:
+    for c in props.get("eventCode", {}).get("NationalWeatherService", []):
         if c in event_codes:
             return event_codes[c]["icon"]
+    return "ℹ️"
 
-    for c in e_codes.get("SAME", []):
-        if c != "NWS" and c in event_codes:
-            return event_codes[c]["icon"]
 
-    return event_codes.get(props.get("event", ""), {}).get("icon", "ℹ️")
-
-# ───────────────────────  Mapbox static map helper (NEW)  ───────────────────────
-
-def build_mapbox_static_url(cfg: Dict[str, Any], feat: dict) -> str | None:
-    """
-    Build a Mapbox Static Images URL that overlays the alert polygon (GeoJSON).
-    If no token is configured or no geometry is present, returns None.
-    """
-    token = cfg.get("mapbox_token")
-    if not token:
-        return None
-
-    geometry = feat.get("geometry")
-    if not geometry:
-        return None
-
-    geojson = {
-        "type": "Feature",
-        "geometry": geometry,
-        "properties": {
-            "stroke": "#ff0000",
-            "stroke-width": 2,
-            "fill": "#ff0000",
-            "fill-opacity": 0.25,
-        },
-    }
-
-    geojson_str = json.dumps(geojson, separators=(",", ":"))
-    geojson_enc = quote(geojson_str, safe="")
-
-    # auto center, auto zoom
-    return (
-        "https://api.mapbox.com/styles/v1/mapbox/light-v11/static/"
-        f"geojson({geojson_enc})/"
-        "auto/800x500"
-        f"?access_token={token}"
-    )
-
-def build_embed(props: dict, cleared: bool = False) -> dict:
-    ev_icon = event_icon(props)
-
-    # Title (short!) – Discord hard limits to 256 chars.
-    headline = props.get("headline") or props["event"]
-    max_len  = 254 - len(ev_icon)
-    if len(headline) > max_len:
-        headline = headline[:max_len - 1] + "…"
-
-    title_txt = f"{ev_icon} {headline}"
+def build_embed(props: dict, cleared: bool) -> dict:
+    title = f"{event_icon(props)} {props.get('headline') or props['event']}"
     if cleared:
-        title_txt = f"~~{title_txt}~~ – CANCELLED"
-
-    # Times
-    starts = props.get("effective") or props["sent"]
-    ends   = props.get("ends") or props.get("expires") or "—"
-
-    # Risk trio
-    sev = props.get("severity", "Unknown").title()
-    urg = props.get("urgency", "Unknown").title()
-    cer = props.get("certainty", "Unknown").title()
-    risk = f"**{sev} • {urg} • {cer}**"
-
-    # Area preview
-    areas = props.get("areaDesc", "").split("; ")
-    area_field = ", ".join(areas[:3]) + (f" … (+{len(areas)-3} more)" if len(areas) > 3 else "")
-
-    # Description
-    # CHANGED: keep FULL text, no paragraph split, no truncation
-    descr = (props.get("description", "") or "").strip()
-    descr = descr[:4000]
+        title = f"~~{title}~~ – CANCELLED"
 
     return {
-        "title": title_txt,
-        "url": props.get("@id") or props.get("id"),
-        "description": descr,
-        "color": hazard_color(props),
+        "title": title[:256],
+        "description": (props.get("description") or "")[:4096],
+        "color": SEVERITY_COLOR.get(props.get("severity"), 0x808080),
         "timestamp": props["sent"],
         "fields": [
-            {"name": "Starts",   "value": starts,     "inline": True},
-            {"name": "Ends",     "value": ends,       "inline": True},
-            {"name": "Severity", "value": risk,       "inline": False},
-            {"name": "Affected", "value": area_field, "inline": False},
+            {"name": "Starts", "value": props.get("effective") or props["sent"], "inline": True},
+            {"name": "Ends", "value": props.get("ends") or props.get("expires") or "—", "inline": True},
+            {"name": "Affected", "value": props.get("areaDesc",""), "inline": False},
         ],
-        "footer": {
-            "text": f"{props.get('senderName','NWS')} – "
-                    f"{datetime.fromisoformat(props['sent']).strftime('%b %d %I:%M %p')}"
-        }
     }
 
-# ───────────────────────  Alert life-cycle helpers  ───────────────────────
 
-def parse_iso(ts: str | None) -> datetime | None:
-    if not ts:
+# ───────────────────────  MAP LOGIC  ───────────────────────
+
+def render_map_png(cfg: Dict[str, Any], props: dict, ua: str) -> Optional[bytes]:
+    if not cfg.get("mapbox_token"):
+        log.debug("Map: no mapbox token")
         return None
-    return isoparse(ts).astimezone(UTC)
-
-def event_end_iso(props: dict) -> str | None:
-    ends = props.get("ends")
-    if ends:
-        return ends
-    end_param = (props.get("parameters", {}).get("eventEndingTime") or [None])[0]
-    if end_param:
-        return end_param
-    return None
-
-def derive_expires(props: dict) -> str:
-    t_end = (parse_iso(event_end_iso(props)) or parse_iso(props.get("expires")))
-    if not t_end:
-        t_end = datetime.now(UTC) + timedelta(days=14)
-    return t_end.isoformat()
-
-def _first(*vals):
-    return next((v for v in vals if v), None)
-
-def is_still_effective(props: dict, now: datetime) -> bool:
-    if props.get("messageType", "").lower() == "cancel":
-        return False
-    if "replacedBy" in props:
-        return False
-
-    t_end = _first(
-        parse_iso(props.get("expires")),
-        parse_iso(props.get("ends")),
-        parse_iso((props.get("parameters", {}).get("eventEndingTime") or [None])[0]),
-    )
-    return not (t_end and now >= t_end)
-
-# ───────────────────────  Runner (per zone)  ───────────────────────
-
-def run_for_zone(cfg: Dict[str, Any], zone: Dict[str, Any]) -> None:
-    zone_id   = zone["zone_id"]
-    webhooks  = zone.get("webhooks", [])
-    if not webhooks:
-        log.warning("No webhook configured for zone %s – skipping", zone_id)
-        return
-
-    state = load_state(cfg, zone_id)
-    now   = datetime.now(UTC)
 
     try:
-        feats = fetch_recent_alerts(zone_id, cfg.get("user_agent", "noaa_alerts_bot"))
-    except Exception as e:
-        log.exception("NWS fetch failed for %s: %s", zone_id, e)
-        return
+        from shapely.geometry import shape
+        from shapely.ops import unary_union
+        from pyproj import Transformer
+        from PIL import Image, ImageDraw
+    except Exception:
+        log.debug("Map: missing dependencies")
+        return None
 
-    latest = latest_by_chain(feats)
-    cur    = state.get("alerts", {})
+    geoms = []
 
-    # Process chains oldest → newest so Discord posts are in chronological order
-    for cid, feat in sorted(latest.items(), key=lambda kv: kv[1]["properties"]["sent"]):
-        props   = feat["properties"]
-        cap_id  = props["id"]
-        row     = cur.get(cid)
-        active  = is_still_effective(props, now)
-        cleared = not active
+    # 1) geocode.UGC → county zones
+    for ugc in props.get("geocode", {}).get("UGC", []):
+        if isinstance(ugc, str) and len(ugc) == 6 and ugc[2] == "C":
+            url = f"https://api.weather.gov/zones/county/{ugc}"
+            try:
+                r = requests.get(url, headers={"User-Agent": ua}, timeout=20)
+                r.raise_for_status()
+                geoms.append(shape(r.json()["geometry"]))
+                log.debug("Map: got county %s", ugc)
+            except Exception:
+                pass
 
+    # 2) affectedZones
+    for url in props.get("affectedZones", []):
         try:
-            embed = build_embed(props, cleared)
+            r = requests.get(url, headers={"User-Agent": ua}, timeout=20)
+            r.raise_for_status()
+            if r.json().get("geometry"):
+                geoms.append(shape(r.json()["geometry"]))
+                log.debug("Map: got affected zone %s", url)
+        except Exception:
+            pass
 
-            # NEW: attach map image (if configured + geometry exists)
-            map_url = build_mapbox_static_url(cfg, feat)
-            if map_url:
-                embed["image"] = {"url": map_url}
+    if not geoms:
+        log.debug("Map: no geometries found – skipping")
+        return None
 
-            if row is None:
-                # Never seen this chain before
-                if cleared:
-                    log.debug("[%s] Skipped expired %s (never seen)", zone_id, cid)
-                    continue
+    merged = unary_union(geoms)
+    min_lon, min_lat, max_lon, max_lat = merged.bounds
 
-                # Still active → post now (use 1st webhook only, or all – your choice)
-                msg_id = discord_post_embed(embed, webhooks[0])
+    pad_lon = max((max_lon - min_lon) * MAP_PAD_FRAC, MAP_PAD_MIN_DEG)
+    pad_lat = max((max_lat - min_lat) * MAP_PAD_FRAC, MAP_PAD_MIN_DEG)
+    bbox = (min_lon - pad_lon, min_lat - pad_lat, max_lon + pad_lon, max_lat + pad_lat)
 
-                cur[cid] = {
-                    "cap_id":     cap_id,
-                    "discord_id": msg_id,
-                    "status":     "posted",
-                    "expires_at": derive_expires(props),
-                }
-                log.info("[%s] Posted %s (new)", zone_id, cid)
+    west, south, east, north = bbox
+    style = cfg.get("mapbox_style")
+    url = (
+        f"https://api.mapbox.com/styles/v1/{style}/static/"
+        f"[{west},{south},{east},{north}]/{MAP_WIDTH}x{MAP_HEIGHT}"
+        f"?access_token={cfg['mapbox_token']}"
+    )
 
-            else:
-                row_status      = row["status"]
-                already_cleared = (row_status == "cleared")
-                should_edit     = (cap_id != row["cap_id"]) or (cleared and not already_cleared)
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
 
-                if not should_edit:
-                    continue
+    img = Image.open(BytesIO(r.content)).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0,0,0,0))
+    draw = ImageDraw.Draw(overlay)
 
-                # Patch the message
-                try:
-                    discord_edit_embed(row["discord_id"], embed, webhooks[0])
-                except requests.HTTPError as e:
-                    # Discord returned 404? Re-post and replace the id.
-                    if e.response is not None and e.response.status_code == 404:
-                        log.warning("[%s] Discord 404 for %s – re-posting", zone_id, cid)
-                        new_id = discord_post_embed(embed, webhooks[0])
-                        row["discord_id"] = new_id
-                    else:
-                        raise
+    tx = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    minx, miny = tx.transform(west, south)
+    maxx, maxy = tx.transform(east, north)
 
-                row["cap_id"]     = cap_id
-                row["status"]     = "cleared" if cleared else "updated"
-                row["expires_at"] = derive_expires(props)
-                log.info("[%s] Edited %s (%s)", zone_id, cid, row["status"])
+    def px(lon, lat):
+        x, y = tx.transform(lon, lat)
+        return (
+            (x - minx) / (maxx - minx) * MAP_WIDTH,
+            (maxy - y) / (maxy - miny) * MAP_HEIGHT,
+        )
 
-        except Exception as e:
-            log.exception("[%s] Discord failure for %s: %s", zone_id, cid, e)
+    def draw_poly(p):
+        pts = [px(x,y) for x,y in p.exterior.coords]
+        draw.polygon(pts, fill=MAP_FILL_RGBA)
+        draw.line(pts, fill=MAP_STROKE_RGBA, width=MAP_STROKE_W)
 
-    # Prune very old stuff and persist
+    if merged.geom_type == "Polygon":
+        draw_poly(merged)
+    else:
+        for g in merged.geoms:
+            draw_poly(g)
+
+    img.alpha_composite(overlay)
+    out = BytesIO()
+    img.save(out, "PNG")
+    log.debug("Map: rendered PNG")
+    return out.getvalue()
+
+
+# ───────────────────────  ALERT LOOP  ───────────────────────
+
+def is_still_effective(props: dict, now: datetime) -> bool:
+    if props.get("messageType","").lower() == "cancel":
+        return False
+    end = props.get("expires") or props.get("ends")
+    if end and isoparse(end) <= now:
+        return False
+    return True
+
+
+def run_for_zone(cfg: Dict[str, Any], zone: Dict[str, Any]):
+    zone_id = zone["zone_id"]
+    webhook = zone["webhooks"][0]
+
+    state = load_state(cfg, zone_id)
+    now = datetime.now(UTC)
+
+    feats = fetch_recent_alerts(zone_id, cfg["user_agent"])
+    latest = latest_by_chain(feats)
+
+    for cid, feat in sorted(latest.items(), key=lambda kv: kv[1]["properties"]["sent"]):
+        props = feat["properties"]
+        active = is_still_effective(props, now)
+        cleared = not active
+        row = state["alerts"].get(cid)
+
+        embed = build_embed(props, cleared)
+
+        if row is None:
+            if cleared:
+                continue
+
+            png = render_map_png(cfg, props, cfg["user_agent"])
+            file = None
+            if png:
+                embed["image"] = {"url": f"attachment://{MAP_ATTACHMENT_FILENAME}"}
+                file = (MAP_ATTACHMENT_FILENAME, png)
+
+            msg_id = discord_post_embed(embed, webhook, file)
+            state["alerts"][cid] = {
+                "cap_id": props["id"],
+                "discord_id": msg_id,
+                "status": "posted",
+                "expires_at": props.get("expires") or props.get("ends") or now.isoformat(),
+            }
+            log.info("[%s] Posted %s (new)", zone_id, cid)
+
     prune_state(state, now)
-    state["alerts"] = cur
     save_state(cfg, zone_id, state)
+
 
 # ─────────────────────────  main  ─────────────────────────
 
 def main():
-    # Resolve paths (env overrides supported)
-    cfg_path, log_dir, state_default = resolve_paths()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config")
+    args = ap.parse_args()
 
-    # If the config is missing, fail fast *before* we even try to log to file.
-    if not cfg_path.exists():
-        # minimal console logger so the user sees _something_
-        logging.basicConfig(level=logging.ERROR, format="%(asctime)s  %(levelname)s  %(message)s")
-        logging.error("Config file %s not found. Aborting.", cfg_path)
-        raise SystemExit(2)
+    cfg_path, log_dir, state_dir = resolve_paths(args.config)
+    tmp_cfg = json.loads(cfg_path.read_text())
 
-    # Load config now (so we can grab log_level), then initialize full logging
-    tmp_cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    level   = get_log_level(tmp_cfg.get("log_level") or os.environ.get("NOAA_ALERTS_LOGLEVEL"))
-
+    level = get_log_level(os.environ.get("NOAA_ALERTS_LOGLEVEL") or tmp_cfg.get("log_level"))
     global log
-    log = setup_logging(log_dir, f"{APP_NAME}.log", level=level)
+    log = setup_logging(log_dir, level)
 
-    # Re-load using our loader (so it also validates & creates state_dir)
-    cfg = load_config(cfg_path, state_default)
+    cfg = load_config(cfg_path, state_dir)
 
     log.info("Starting %s %s with config=%s", APP_NAME, __version__, cfg_path)
 
-    # Run each zone
     for zone in cfg["zones"]:
-        try:
-            run_for_zone(cfg, zone)
-        except Exception:
-            log.exception("Unhandled error while processing zone %s", zone.get("zone_id"))
+        run_for_zone(cfg, zone)
 
     log.info("Run completed.")
+
 
 if __name__ == "__main__":
     main()
